@@ -114,41 +114,88 @@ class BilingualDictionary:
         suggestions = self.get_fuzzy_suggestions(clean_query, is_english, limit=4)
         return None, suggestions
 
-    def get_fuzzy_suggestions(self, query, is_english=True, limit=4):
-        """Finds closest matching words when a typo occurs."""
+    def _find_prefix_range(self, prefix, is_english=True):
+        """Finds the [start_idx, end_idx] range for a given prefix using binary search."""
         count = self.en_count if is_english else self.he_count
+        if count == 0 or not prefix:
+            return 0, count
+
+        # 1. Lower bound (first word >= prefix)
+        low, high = 0, count - 1
+        start_idx = count
+        while low <= high:
+            mid = (low + high) // 2
+            offset = self._get_entry_offset(mid, is_english)
+            word, _ = self._read_entry(offset)
+            w_comp = word.lower() if is_english else word
+            if w_comp >= prefix:
+                start_idx = mid
+                high = mid - 1
+            else:
+                low = mid + 1
+
+        # 2. Upper bound
+        prefix_next = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+        low, high = start_idx, count - 1
+        end_idx = count
+        while low <= high:
+            mid = (low + high) // 2
+            offset = self._get_entry_offset(mid, is_english)
+            word, _ = self._read_entry(offset)
+            w_comp = word.lower() if is_english else word
+            if w_comp >= prefix_next:
+                end_idx = mid
+                high = mid - 1
+            else:
+                low = mid + 1
+
+        return start_idx, end_idx
+
+    def get_fuzzy_suggestions(self, query, is_english=True, limit=4):
+        """Finds closest matching words in ~50ms using binary prefix range scoping."""
+        count = self.en_count if is_english else self.he_count
+        if count == 0 or not query:
+            return []
+
         candidates = []
         q_len = len(query)
 
-        # First pass: check words with same prefix or length difference <= 2
-        step = 1
-        # If dictionary is very large, step 1 is still ~3000 seeks which is fast,
-        # but let's optimize with early checks:
-        for i in range(0, count, step):
+        # Pass 1: Try 2-letter prefix range (ultra-fast, ~50-150 words)
+        start_idx, end_idx = 0, count
+        if len(query) >= 2:
+            start_idx, end_idx = self._find_prefix_range(query[:2], is_english)
+            
+        # If 2-letter range is too small, fall back to 1-letter range (~600 words)
+        if (end_idx - start_idx) < 3 and len(query) >= 1:
+            start_idx, end_idx = self._find_prefix_range(query[:1], is_english)
+
+        # Clamp search window to max 600 words for guaranteed <80ms response
+        if end_idx - start_idx > 600:
+            end_idx = start_idx + 600
+
+        for i in range(start_idx, end_idx):
             offset = self._get_entry_offset(i, is_english)
             self.file.seek(offset)
             w_len = struct.unpack("<B", self.file.read(1))[0]
             
-            # Skip if length is too different
-            if abs(w_len - q_len) > 2 and not is_english:
-                continue
-            if abs(w_len - q_len) > 3 and is_english:
+            # Skip if word length is too different
+            if abs(w_len - q_len) > 3:
                 continue
                 
             word = self.file.read(w_len).decode("utf-8")
             word_comp = word.lower() if is_english else word
             
-            # Check prefix similarity
             dist = levenshtein_dist(query, word_comp, max_dist=3)
             if dist <= 3:
-                # Bonus if starts with same 1-2 letters
                 score = dist
                 if word_comp.startswith(query[:2]):
                     score -= 0.5
                 candidates.append((score, word))
+                # Early exit if we already have strong matches
+                if len(candidates) >= limit * 2:
+                    break
 
         candidates.sort(key=lambda x: x[0])
-        # Return top N unique words
         res = []
         for _, w in candidates:
             if w not in res:

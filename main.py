@@ -22,12 +22,12 @@ class MilonitApp:
     def __init__(self):
         print("Starting Milonit on Waveshare RP2350-Touch-LCD-2.8...")
         
-        # 1. Overclock RP2350 to 250 MHz for peak performance and zero-lag responsiveness
+        # 1. Standard Factory Frequency 150 MHz for maximum battery life and hardware longevity
         try:
-            machine.freq(250_000_000)
-            print("CPU Frequency set to 250 MHz.")
+            machine.freq(150_000_000)
+            print("CPU Frequency set to factory standard 150 MHz.")
         except Exception as e:
-            print("Frequency adjustment notice:", e)
+            print("Frequency setting notice:", e)
 
         # 2. Power enable for RP2350 (BAT_EN)
         try:
@@ -139,14 +139,19 @@ class MilonitApp:
             target = self.definition.split(',')[0].split(';')[0].strip()
         
         if target:
-            # Highlight speak button visually
+            # Highlight speak button visually (Active blue state)
             sx, sy, sw, sh = self.btn_speak["x"], self.btn_speak["y"], self.btn_speak["w"], self.btn_speak["h"]
-            self.display.fill_rect(sx, sy, sw, sh, WHITE)
+            self.display.fill_rect(sx, sy, sw, sh, ACCENT_BLUE)
+            self.display.rect(sx, sy, sw, sh, WHITE)
+            fonts.draw_text(self.display, "משמיע..." if self.kb.is_english else "PLAY...", sx + 6, sy + 3, WHITE, bg=ACCENT_BLUE)
             self.display.flush_rect(sx, sy, sw, sh)
             
-            self.audio.speak_word(target)
+            try:
+                self.audio.speak_word(target)
+            except Exception as e:
+                print("Speech playback notice:", e)
             
-            # Restore button
+            # Restore normal green button
             self.display.fill_rect(sx, sy, sw, sh, SPEAK_BG)
             self.display.rect(sx, sy, sw, sh, SPEAK_BORDER)
             fonts.draw_text(self.display, "הקרא" if self.kb.is_english else "SPEAK", sx + 18, sy + 3, WHITE, bg=SPEAK_BG)
@@ -394,8 +399,8 @@ class MilonitApp:
             if pt is not None:
                 tx, ty = pt
                 if not self.touch_down:
-                    # Fresh touch down edge: trigger ONCE!
-                    if time.ticks_diff(now, self.last_tap_time) > 75:
+                    # Fresh touch down edge: trigger ONCE with comfortable 150ms debounce
+                    if time.ticks_diff(now, self.last_tap_time) > 150:
                         self.touch_down = True
                         self.last_tap_time = now
                         self.handle_tap(tx, ty)

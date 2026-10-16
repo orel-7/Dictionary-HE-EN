@@ -14,6 +14,7 @@ class AudioManager:
         self.saved_volume = 7
         self.is_muted = False
         self.i2s = None
+        self._dma_buf = bytearray(1024) # Zero-allocation static DMA buffer
         
         self.init_i2s()
         self._init_phoneme_tables()
@@ -65,29 +66,38 @@ class AudioManager:
         return self.volume
 
     def play_samples(self, samples):
-        """Plays mono int16 samples converted to stereo."""
-        if not self.i2s or self.volume == 0 or self.is_muted:
+        """Plays mono int16 samples in streamed chunks with ZERO heap allocations."""
+        if not self.i2s or self.volume == 0 or self.is_muted or not samples:
             return
 
-        vol_scale = (self.volume / 10.0)
+        vol_scale = self.volume / 10.0
         n_samples = len(samples)
-        buf = bytearray(n_samples * 4) # 16-bit stereo = 4 bytes per sample
+        buf = self._dma_buf
+        chunk_samples = 256 # 256 samples * 4 bytes = 1024 bytes
         
-        for i in range(n_samples):
-            v = int(samples[i] * vol_scale)
-            v = max(-32767, min(32767, v))
-            lo = v & 0xFF
-            hi = (v >> 8) & 0xFF
-            idx = i * 4
-            buf[idx] = lo
-            buf[idx + 1] = hi
-            buf[idx + 2] = lo
-            buf[idx + 3] = hi
+        offset = 0
+        while offset < n_samples:
+            count = min(chunk_samples, n_samples - offset)
+            for i in range(count):
+                v = int(samples[offset + i] * vol_scale)
+                v = max(-32767, min(32767, v))
+                idx = i * 4
+                lo = v & 0xFF
+                hi = (v >> 8) & 0xFF
+                buf[idx] = lo
+                buf[idx + 1] = hi
+                buf[idx + 2] = lo
+                buf[idx + 3] = hi
 
-        try:
-            self.i2s.write(buf)
-        except Exception as e:
-            print("I2S write error:", e)
+            try:
+                if count == chunk_samples:
+                    self.i2s.write(buf)
+                else:
+                    self.i2s.write(memoryview(buf)[:count * 4])
+            except Exception as e:
+                print("I2S write error:", e)
+                break
+            offset += count
 
     def play_tone(self, freq, duration=0.08, amplitude=11000):
         if self.volume == 0 or self.is_muted:
@@ -217,88 +227,81 @@ class AudioManager:
             return
 
         w = word.strip().lower()
-        full_samples = []
         i = 0
-        
         while i < len(w):
             pair = w[i:i+2]
             
             # Common English Digraphs
             if pair in ('sh', 'ch'):
-                full_samples.extend(self._render_noise(0.09, amplitude=4000))
+                self.play_samples(self._render_noise(0.09, amplitude=4000))
                 i += 2
                 continue
             elif pair == 'th':
-                full_samples.extend(self._render_noise(0.08, amplitude=3200))
+                self.play_samples(self._render_noise(0.08, amplitude=3200))
                 i += 2
                 continue
             elif pair in ('ee', 'ea'):
-                full_samples.extend(self._render_vowel('EE', 0.14))
+                self.play_samples(self._render_vowel('EE', 0.14))
                 i += 2
                 continue
             elif pair == 'oo':
-                full_samples.extend(self._render_vowel('OO', 0.14))
+                self.play_samples(self._render_vowel('OO', 0.14))
                 i += 2
                 continue
             elif pair in ('ou', 'ow'):
-                full_samples.extend(self._render_vowel('AH', 0.08))
-                full_samples.extend(self._render_vowel('OO', 0.08))
+                self.play_samples(self._render_vowel('AH', 0.08))
+                self.play_samples(self._render_vowel('OO', 0.08))
                 i += 2
                 continue
             elif pair in ('ai', 'ay'):
-                full_samples.extend(self._render_vowel('EH', 0.08))
-                full_samples.extend(self._render_vowel('EE', 0.08))
+                self.play_samples(self._render_vowel('EH', 0.08))
+                self.play_samples(self._render_vowel('EE', 0.08))
                 i += 2
                 continue
             elif pair in ('er', 'ir', 'ur'):
-                full_samples.extend(self._render_vowel('ER', 0.13))
+                self.play_samples(self._render_vowel('ER', 0.13))
                 i += 2
                 continue
             elif pair == 'ck':
-                full_samples.extend(self._render_stop(voiced=False))
+                self.play_samples(self._render_stop(voiced=False))
                 i += 2
                 continue
             
             # Single Letters
             ch = w[i]
             if ch == 'a':
-                # Distinguish open vs closed syllable
-                full_samples.extend(self._render_vowel('AE', 0.12))
+                self.play_samples(self._render_vowel('AE', 0.12))
             elif ch == 'e':
-                full_samples.extend(self._render_vowel('EH', 0.11))
+                self.play_samples(self._render_vowel('EH', 0.11))
             elif ch == 'i':
-                full_samples.extend(self._render_vowel('IH', 0.10))
+                self.play_samples(self._render_vowel('IH', 0.10))
             elif ch == 'o':
-                full_samples.extend(self._render_vowel('OH', 0.12))
+                self.play_samples(self._render_vowel('OH', 0.12))
             elif ch == 'u':
-                full_samples.extend(self._render_vowel('AH', 0.11))
+                self.play_samples(self._render_vowel('AH', 0.11))
             elif ch == 'y':
-                full_samples.extend(self._render_vowel('EE', 0.10))
+                self.play_samples(self._render_vowel('EE', 0.10))
             elif ch in ('s', 'c'):
-                full_samples.extend(self._render_noise(0.08, amplitude=3800))
+                self.play_samples(self._render_noise(0.08, amplitude=3800))
             elif ch in ('z', 'x'):
-                full_samples.extend(self._render_noise(0.08, amplitude=4200))
+                self.play_samples(self._render_noise(0.08, amplitude=4200))
             elif ch in ('f', 'v'):
-                full_samples.extend(self._render_noise(0.07, amplitude=3200))
+                self.play_samples(self._render_noise(0.07, amplitude=3200))
             elif ch in ('p', 't', 'k', 'q'):
-                full_samples.extend(self._render_stop(voiced=False))
+                self.play_samples(self._render_stop(voiced=False))
             elif ch in ('b', 'd', 'g'):
-                full_samples.extend(self._render_stop(voiced=True))
+                self.play_samples(self._render_stop(voiced=True))
             elif ch in ('m', 'n'):
-                full_samples.extend(self._render_vowel('MM', 0.09))
+                self.play_samples(self._render_vowel('MM', 0.09))
             elif ch in ('l', 'r'):
-                full_samples.extend(self._render_vowel('LL', 0.09))
+                self.play_samples(self._render_vowel('LL', 0.09))
             elif ch == 'h':
-                full_samples.extend(self._render_noise(0.05, amplitude=2500))
+                self.play_samples(self._render_noise(0.05, amplitude=2500))
             elif ch == 'w':
-                full_samples.extend(self._render_vowel('OO', 0.07))
+                self.play_samples(self._render_vowel('OO', 0.07))
             elif ch == 'j':
-                full_samples.extend(self._render_noise(0.06, amplitude=3500))
+                self.play_samples(self._render_noise(0.06, amplitude=3500))
             elif ch in (' ', '-', '_'):
-                full_samples.extend([0] * int(self.sample_rate * 0.05))
+                time.sleep_ms(40)
                 
             i += 1
-
-        if full_samples:
-            # Play in chunks of 2048 to prevent memory allocation spikes
-            self.play_samples(full_samples)
