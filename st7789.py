@@ -147,6 +147,30 @@ class ST7789:
         self.spi.write(self.buffer)
         self.cs(1)
 
+    def flush_rect(self, x, y, w, h):
+        """Flushes only a specific rectangular region of the framebuffer to display (Ultra Fast)."""
+        if x < 0:
+            w += x
+            x = 0
+        if y < 0:
+            h += y
+            y = 0
+        if w <= 0 or h <= 0 or x >= self.width or y >= self.height:
+            return
+        x1 = min(self.width - 1, x + w - 1)
+        y1 = min(self.height - 1, y + h - 1)
+        
+        self.set_window(x, y, x1, y1)
+        self.cs(0)
+        self.dc(1)
+        
+        mv = memoryview(self.buffer)
+        row_len = (x1 - x + 1) * 2
+        for r in range(y, y1 + 1):
+            offset = (r * self.width + x) * 2
+            self.spi.write(mv[offset : offset + row_len])
+        self.cs(1)
+
     # FrameBuffer delegation
     def fill(self, color):
         self.fb.fill(color)

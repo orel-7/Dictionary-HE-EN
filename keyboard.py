@@ -96,47 +96,45 @@ class VirtualKeyboard:
             "is_special": True
         })
 
+    def draw_key(self, display, k, is_pressed=False, flush=True):
+        """Draws and optionally flushes a single key for ultra-fast visual feedback."""
+        if is_pressed:
+            bg = KEY_ACTIVE
+            border = ACCENT_BLUE
+            fg = ACCENT_BLUE
+        elif k["type"] == "search":
+            bg = ACCENT_BLUE
+            border = ACCENT_BLUE
+            fg = WHITE
+        elif k["is_special"]:
+            bg = KEY_SPECIAL
+            border = KEY_BORDER
+            fg = TEXT_DARK
+        else:
+            bg = KEY_BG
+            border = KEY_BORDER
+            fg = TEXT_DARK
+            
+        x, y, w, h = k["x"], k["y"], k["w"], k["h"]
+        display.fill_rect(x + 1, y + 1, w - 2, h - 2, bg)
+        display.rect(x, y, w, h, border)
+        
+        lbl = k["label"]
+        lbl_len = len(lbl)
+        lbl_w = lbl_len * fonts.WIDTH
+        text_x = x + (w - lbl_w) // 2
+        text_y = y + (h - fonts.HEIGHT) // 2
+        fonts.draw_text(display, lbl, text_x, text_y, fg, bg=bg)
+        
+        if flush and hasattr(display, 'flush_rect'):
+            display.flush_rect(x, y, w, h)
+
     def draw(self, display, active_key_obj=None):
-        """Draws all keys directly to the display."""
-        # Draw keyboard background bar
+        """Draws all keys directly to the display framebuffer."""
         display.fill_rect(0, self.y_start - 2, 320, self.height + 2, KEY_SPECIAL)
         display.hline(0, self.y_start - 2, 320, KEY_BORDER)
-        
         for k in self.keys:
-            is_pressed = (active_key_obj is not None and k == active_key_obj)
-            
-            if is_pressed:
-                bg = KEY_ACTIVE
-                border = ACCENT_BLUE
-                fg = ACCENT_BLUE
-            elif k["type"] == "search":
-                bg = ACCENT_BLUE
-                border = ACCENT_BLUE
-                fg = WHITE
-            elif k["is_special"]:
-                bg = KEY_SPECIAL
-                border = KEY_BORDER
-                fg = TEXT_DARK
-            else:
-                bg = KEY_BG
-                border = KEY_BORDER
-                fg = TEXT_DARK
-                
-            x, y, w, h = k["x"], k["y"], k["w"], k["h"]
-            
-            # Fill key body
-            display.fill_rect(x + 1, y + 1, w - 2, h - 2, bg)
-            # Border
-            display.rect(x, y, w, h, border)
-            
-            # Label
-            lbl = k["label"]
-            lbl_len = len(lbl)
-            lbl_w = lbl_len * fonts.WIDTH
-            text_x = x + (w - lbl_w) // 2
-            text_y = y + (h - fonts.HEIGHT) // 2
-            
-            fonts.draw_text(display, lbl, text_x, text_y, fg, bg=bg)
+            self.draw_key(display, k, is_pressed=(active_key_obj is not None and k == active_key_obj), flush=False)
 
     def handle_touch(self, tx, ty):
         """Returns the key object touched at (tx, ty), or None."""

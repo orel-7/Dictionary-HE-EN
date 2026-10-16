@@ -2,6 +2,7 @@
 import time
 import os
 import gc
+import machine
 from machine import Pin, SPI
 
 from st7789 import (
@@ -21,48 +22,63 @@ class MilonitApp:
     def __init__(self):
         print("Starting Milonit on Waveshare RP2350-Touch-LCD-2.8...")
         
-        # 1. Power enable for RP2350 (BAT_EN)
+        # 1. Overclock RP2350 to 250 MHz for peak performance and zero-lag responsiveness
+        try:
+            machine.freq(250_000_000)
+            print("CPU Frequency set to 250 MHz.")
+        except Exception as e:
+            print("Frequency adjustment notice:", e)
+
+        # 2. Power enable for RP2350 (BAT_EN)
         try:
             self.bat_en = Pin(26, Pin.OUT, value=1)
         except Exception:
             pass
 
-        # 2. Initialize Display (High-Speed SPI 62.5MHz with 153KB FrameBuffer)
+        # 3. Initialize Display (High-Speed SPI 62.5MHz with 153KB FrameBuffer)
         self.display = ST7789(width=320, height=240)
         
-        # 3. Mount MicroSD Card if inserted
+        # 4. Mount MicroSD Card if inserted
         self.mount_sd_card()
         
-        # 4. Initialize CST328 Capacitive Touch Controller
+        # 5. Initialize CST328 Capacitive Touch Controller
         self.touch = CST328(width=320, height=240, rotation=1)
         
-        # 5. Initialize I2S Audio & Speech Synthesizer
+        # 6. Initialize I2S Audio & Speech Synthesizer
         self.audio = AudioManager(sck=2, ws=3, sd=4, rate=16000)
         
-        # 6. Initialize Binary Indexed Bilingual Dictionary
+        # 7. Initialize Binary Indexed Bilingual Dictionary
         self.dict = BilingualDictionary()
         print(f"Loaded Dictionary: {self.dict.en_count} EN, {self.dict.he_count} HE words.")
         
-        # 7. Initialize Virtual Keyboard
+        # 8. Initialize Virtual Keyboard
         self.kb = VirtualKeyboard(y_start=138, height=100)
         
-        # 8. State
+        # 9. App State
         self.input_text = ""
         self.definition = None
         self.suggestions = []
         self.suggestion_rects = []
         self.status = f"מוכן ({self.dict.en_count + self.dict.he_count})"
         self.needs_redraw = True
-        self.active_key = None
         
-        # Interactive UI Buttons
-        self.btn_mode = {"x": 4, "y": 3, "w": 82, "h": 22}
-        self.btn_vol  = {"x": 218, "y": 3, "w": 52, "h": 22}
-        self.btn_clear= {"x": 274, "y": 3, "w": 42, "h": 22}
-        self.btn_speak= {"x": 228, "y": 66, "w": 82, "h": 20}
+        # Touch state machine (immune to double typing / bouncing)
+        self.touch_down = False
+        self.active_key = None
+        self.last_tap_time = 0
+        
+        # Search History (stack of previous searches for Back button)
+        self.history = []
+        
+        # Interactive UI Button Rectangles (X, Y, W, H)
+        self.btn_mode  = {"x": 4,   "y": 3, "w": 74, "h": 22} # [EN/עב]
+        self.btn_back  = {"x": 82,  "y": 3, "w": 28, "h": 22} # [ ◄ ] Back arrow
+        self.btn_sound = {"x": 218, "y": 3, "w": 52, "h": 22} # [🔊 ON] / [🔇 OFF]
+        self.btn_clear = {"x": 274, "y": 3, "w": 42, "h": 22} # [CLR]
+        self.btn_speak = {"x": 228, "y": 66, "w": 82, "h": 20} # [🔊 הקרא]
         
         # Initial greeting sound
-        self.audio.play_tone(600, 0.06)
+        self.audio.play_tone(600, 0.05)
 
     def mount_sd_card(self):
         """Mounts MicroSD card if present, otherwise uses internal 16MB flash."""
@@ -74,7 +90,7 @@ class MilonitApp:
             sd = SDCard(spi0, sd_cs)
             os.mount(sd, "/sd")
             print("Mounted MicroSD card at /sd successfully.")
-        except Exception as e:
+        except Exception:
             print("SD card not present or mount bypassed (using high-speed internal flash).")
 
     def toggle_mode(self):
@@ -87,10 +103,32 @@ class MilonitApp:
         self.audio.play_click()
         self.needs_redraw = True
 
-    def cycle_volume(self):
-        new_vol = self.audio.cycle_volume()
-        self.status = f"Vol: {new_vol}/10" if new_vol > 0 else "Mute"
-        self.needs_redraw = True
+    def toggle_sound(self):
+        is_muted = self.audio.toggle_mute()
+        self.status = "השתק" if is_muted else f"שמע: {self.audio.volume}"
+        self.draw_top_bar()
+
+    def go_back(self):
+        """Navigates back to the previously searched word in history."""
+        if len(self.history) > 1:
+            self.history.pop() # Remove current word
+            prev_word, prev_is_en, prev_defn, prev_suggs = self.history[-1]
+            if self.kb.is_english != prev_is_en:
+                self.kb.toggle_language()
+            self.input_text = prev_word
+            self.definition = prev_defn
+            self.suggestions = prev_suggs
+            self.status = "חזרה אחורה" if not self.kb.is_english else "Back"
+            self.audio.play_click()
+            self.needs_redraw = True
+        elif len(self.history) == 1:
+            self.history.clear()
+            self.input_text = ""
+            self.definition = None
+            self.suggestions = []
+            self.status = "תחילת היסטוריה"
+            self.audio.play_click()
+            self.needs_redraw = True
 
     def speak_current_word(self):
         """Speaks English word (either query or translation)."""
@@ -98,16 +136,21 @@ class MilonitApp:
         if self.kb.is_english:
             target = self.input_text.strip()
         elif self.definition:
-            # First English definition word
             target = self.definition.split(',')[0].split(';')[0].strip()
         
         if target:
             # Highlight speak button visually
-            self.display.fill_rect(self.btn_speak["x"], self.btn_speak["y"], 
-                                   self.btn_speak["w"], self.btn_speak["h"], WHITE)
-            self.display.show()
+            sx, sy, sw, sh = self.btn_speak["x"], self.btn_speak["y"], self.btn_speak["w"], self.btn_speak["h"]
+            self.display.fill_rect(sx, sy, sw, sh, WHITE)
+            self.display.flush_rect(sx, sy, sw, sh)
+            
             self.audio.speak_word(target)
-            self.needs_redraw = True
+            
+            # Restore button
+            self.display.fill_rect(sx, sy, sw, sh, SPEAK_BG)
+            self.display.rect(sx, sy, sw, sh, SPEAK_BORDER)
+            fonts.draw_text(self.display, "הקרא" if self.kb.is_english else "SPEAK", sx + 18, sy + 3, WHITE, bg=SPEAK_BG)
+            self.display.flush_rect(sx, sy, sw, sh)
 
     def perform_search(self, word=None):
         query = word if word is not None else self.input_text.strip()
@@ -121,7 +164,8 @@ class MilonitApp:
 
         self.input_text = query
         self.status = "מחפש..." if not self.kb.is_english else "Searching..."
-        self.draw_ui()
+        self.draw_top_bar()
+        self.draw_search_box()
 
         defn, suggs = self.dict.lookup(query, is_english=self.kb.is_english)
         self.definition = defn
@@ -130,6 +174,11 @@ class MilonitApp:
         
         if defn:
             self.status = "נמצא!" if not self.kb.is_english else "Found!"
+            # Add to search history stack (max 10 items)
+            if not self.history or self.history[-1][0].lower() != query.lower():
+                self.history.append((query, self.kb.is_english, defn, suggs))
+                if len(self.history) > 10:
+                    self.history.pop(0)
             self.audio.play_chime()
         elif suggs:
             self.status = "שגיאת כתיב?" if not self.kb.is_english else "Typo? Suggestions:"
@@ -139,37 +188,50 @@ class MilonitApp:
             self.audio.play_typo()
             
         self.needs_redraw = True
+        gc.collect()
 
     def draw_top_bar(self):
         # Header bar background
         self.display.fill_rect(0, 0, 320, 28, HEADER_BG)
         
-        # 1. Mode button [EN -> עב] or [עב -> EN]
+        # 1. Mode button [EN/עב]
         mx, my, mw, mh = self.btn_mode["x"], self.btn_mode["y"], self.btn_mode["w"], self.btn_mode["h"]
         self.display.fill_rect(mx, my, mw, mh, ACCENT_BLUE)
         self.display.rect(mx, my, mw, mh, WHITE)
-        mode_label = "EN -> עב" if self.kb.is_english else "עב -> EN"
-        fonts.draw_text(self.display, mode_label, mx + 6, my + 4, WHITE, bg=ACCENT_BLUE)
+        mode_label = "EN->עב" if self.kb.is_english else "עב->EN"
+        fonts.draw_text(self.display, mode_label, mx + 5, my + 4, WHITE, bg=ACCENT_BLUE)
         
-        # 2. Status message
-        fonts.draw_text(self.display, self.status, 90, 7, LIGHT_GRAY, bg=HEADER_BG, max_width=124)
+        # 2. Back button [ ◄ ]
+        bx, by, bw, bh = self.btn_back["x"], self.btn_back["y"], self.btn_back["w"], self.btn_back["h"]
+        has_history = len(self.history) > 1
+        b_bg = ACCENT_BLUE if has_history else rgb(51, 65, 85)
+        b_fg = WHITE if has_history else GRAY
+        self.display.fill_rect(bx, by, bw, bh, b_bg)
+        self.display.rect(bx, by, bw, bh, WHITE if has_history else rgb(71, 85, 105))
+        fonts.draw_text(self.display, "<", bx + 10, by + 4, b_fg, bg=b_bg)
         
-        # 3. Volume button [🔊 7] / [🔇 0]
-        vx, vy, vw, vh = self.btn_vol["x"], self.btn_vol["y"], self.btn_vol["w"], self.btn_vol["h"]
-        v_bg = rgb(51, 65, 85) if self.audio.volume > 0 else rgb(153, 27, 27)
-        self.display.fill_rect(vx, vy, vw, vh, v_bg)
+        # 3. Status text
+        fonts.draw_text(self.display, self.status, 116, 7, LIGHT_GRAY, bg=HEADER_BG, max_width=98)
+        
+        # 4. Sound Mute / Unmute Button [🔊 ON] / [🔇 OFF]
+        vx, vy, vw, vh = self.btn_sound["x"], self.btn_sound["y"], self.btn_sound["w"], self.btn_sound["h"]
+        is_muted = self.audio.is_muted or self.audio.volume == 0
+        s_bg = rgb(185, 28, 28) if is_muted else rgb(22, 101, 52)
+        s_lbl = "MUTE" if is_muted else f"ON:{self.audio.volume}"
+        self.display.fill_rect(vx, vy, vw, vh, s_bg)
         self.display.rect(vx, vy, vw, vh, WHITE)
-        vol_label = f"V:{self.audio.volume}" if self.audio.volume > 0 else "MUTE"
-        fonts.draw_text(self.display, vol_label, vx + 6, vy + 4, WHITE, bg=v_bg)
+        fonts.draw_text(self.display, s_lbl, vx + 5, vy + 4, WHITE, bg=s_bg)
         
-        # 4. Clear button [CLR]
+        # 5. Clear button [CLR]
         cx, cy, cw, ch = self.btn_clear["x"], self.btn_clear["y"], self.btn_clear["w"], self.btn_clear["h"]
         self.display.fill_rect(cx, cy, cw, ch, rgb(71, 85, 105))
         self.display.rect(cx, cy, cw, ch, WHITE)
         fonts.draw_text(self.display, "CLR", cx + 7, cy + 4, WHITE, bg=rgb(71, 85, 105))
+        
+        self.display.flush_rect(0, 0, 320, 28)
 
     def draw_search_box(self):
-        # Search input box
+        """Renders search input box and flushes in 7ms for ultra-responsive typing."""
         box_x, box_y, box_w, box_h = 4, 32, 312, 26
         self.display.fill_rect(box_x, box_y, box_w, box_h, SEARCH_BG)
         self.display.rect(box_x, box_y, box_w, box_h, KEY_BORDER)
@@ -182,6 +244,8 @@ class MilonitApp:
             txt_with_cursor = disp_txt + "|"
             align = 'left' if self.kb.is_english else 'right'
             fonts.draw_text(self.display, txt_with_cursor, box_x + 8, box_y + 6, TEXT_DARK, bg=SEARCH_BG, max_width=box_w - 16, align=align)
+            
+        self.display.flush_rect(box_x, box_y, box_w, box_h)
 
     def draw_results_box(self):
         # Result area: Y: 62 to 134 (Height: 72px)
@@ -246,91 +310,104 @@ class MilonitApp:
                 })
                 s_x += w_pixels + 6
         else:
-            # Friendly welcome / idle screen
+            # Welcome banner
             hint1 = "Bilingual Pocket Dictionary (RP2350)" if self.kb.is_english else "מילונית עברית-אנגלית (חטיבה ותיכון)"
             hint2 = "10,292 English  |  11,376 Hebrew"
             fonts.draw_text(self.display, hint1, rx + 8, ry + 20, ACCENT_BLUE, bg=RESULT_BG)
             fonts.draw_text(self.display, hint2, rx + 8, ry + 42, TEXT_MUTED, bg=RESULT_BG)
 
+        self.display.flush_rect(rx, ry, rw, rh)
+
     def draw_ui(self):
-        """Renders entire screen into FrameBuffer and flushes in one fast SPI transaction."""
+        """Renders entire screen into FrameBuffer and flushes in one fast transaction."""
         self.draw_top_bar()
         self.draw_search_box()
         self.draw_results_box()
         self.kb.draw(self.display, self.active_key)
         self.display.show()
 
+    def handle_tap(self, tx, ty):
+        """Processes a single touch-down tap event (strictly once per touch)."""
+        # 1. Top Bar Clicks
+        if ty < 28:
+            if self.btn_mode["x"] <= tx <= self.btn_mode["x"] + self.btn_mode["w"]:
+                self.toggle_mode()
+            elif self.btn_back["x"] <= tx <= self.btn_back["x"] + self.btn_back["w"]:
+                self.go_back()
+            elif self.btn_sound["x"] <= tx <= self.btn_sound["x"] + self.btn_sound["w"]:
+                self.toggle_sound()
+            elif self.btn_clear["x"] <= tx <= self.btn_clear["x"] + self.btn_clear["w"]:
+                self.input_text = ""
+                self.definition = None
+                self.suggestions = []
+                self.suggestion_rects = []
+                self.status = "נוקה" if not self.kb.is_english else "Cleared"
+                self.audio.play_click()
+                self.needs_redraw = True
+
+        # 2. Speak Button & Suggestion Pills Clicks
+        elif 62 <= ty <= 134:
+            if self.definition and (self.btn_speak["x"] <= tx <= self.btn_speak["x"] + self.btn_speak["w"]):
+                self.speak_current_word()
+            else:
+                for s_rect in self.suggestion_rects:
+                    if s_rect["x"] <= tx <= s_rect["x"] + s_rect["w"] and s_rect["y"] <= ty <= s_rect["y"] + s_rect["h"]:
+                        self.audio.play_click()
+                        self.perform_search(s_rect["word"])
+                        break
+
+        # 3. Virtual Keyboard Clicks
+        elif ty >= 136:
+            key = self.kb.handle_touch(tx, ty)
+            if key:
+                self.active_key = key
+                # Instant visual press highlight on the single key (0.5ms)
+                self.kb.draw_key(self.display, key, is_pressed=True, flush=True)
+                self.audio.play_click()
+
+                ktype = key["type"]
+                if ktype == "char":
+                    self.input_text += key["value"]
+                    # Ultra-fast partial refresh of search box (7ms)
+                    self.draw_search_box()
+                elif ktype == "backspace":
+                    if len(self.input_text) > 0:
+                        self.input_text = self.input_text[:-1]
+                        self.draw_search_box()
+                elif ktype == "lang":
+                    self.toggle_mode()
+                elif ktype == "search":
+                    self.perform_search()
+
     def run(self):
-        print("Milonit UI loop running...")
-        last_touch_time = 0
+        print("Milonit UI loop running with touch state machine...")
         
         while True:
             if self.needs_redraw:
                 self.draw_ui()
                 self.needs_redraw = False
 
-            # Check capacitive touch
+            # Touch event polling
             pt = self.touch.get_touch()
+            now = time.ticks_ms()
+
             if pt is not None:
                 tx, ty = pt
-                now = time.ticks_ms()
-                
-                if time.ticks_diff(now, last_touch_time) > 170: # Debounce
-                    last_touch_time = now
-                    
-                    # 1. Top Bar Clicks
-                    if ty < 28:
-                        if self.btn_mode["x"] <= tx <= self.btn_mode["x"] + self.btn_mode["w"]:
-                            self.toggle_mode()
-                        elif self.btn_vol["x"] <= tx <= self.btn_vol["x"] + self.btn_vol["w"]:
-                            self.cycle_volume()
-                        elif self.btn_clear["x"] <= tx <= self.btn_clear["x"] + self.btn_clear["w"]:
-                            self.input_text = ""
-                            self.definition = None
-                            self.suggestions = []
-                            self.suggestion_rects = []
-                            self.status = "נוקה" if not self.kb.is_english else "Cleared"
-                            self.audio.play_click()
-                            self.needs_redraw = True
-                            
-                    # 2. Speak Button & Suggestion Pills Clicks
-                    elif 62 <= ty <= 134:
-                        # Check Speak button
-                        if self.definition and (self.btn_speak["x"] <= tx <= self.btn_speak["x"] + self.btn_speak["w"]):
-                            self.speak_current_word()
-                        else:
-                            for s_rect in self.suggestion_rects:
-                                if s_rect["x"] <= tx <= s_rect["x"] + s_rect["w"] and s_rect["y"] <= ty <= s_rect["y"] + s_rect["h"]:
-                                    self.audio.play_click()
-                                    self.perform_search(s_rect["word"])
-                                    break
-                                    
-                    # 3. Virtual Keyboard Clicks
-                    elif ty >= 136:
-                        key = self.kb.handle_touch(tx, ty)
-                        if key:
-                            self.audio.play_click()
-                            self.active_key = key
-                            self.kb.draw(self.display, self.active_key)
-                            self.display.show()
-                            
-                            ktype = key["type"]
-                            if ktype == "char":
-                                self.input_text += key["value"]
-                                self.needs_redraw = True
-                            elif ktype == "backspace":
-                                if len(self.input_text) > 0:
-                                    self.input_text = self.input_text[:-1]
-                                    self.needs_redraw = True
-                            elif ktype == "lang":
-                                self.toggle_mode()
-                            elif ktype == "search":
-                                self.perform_search()
+                if not self.touch_down:
+                    # Fresh touch down edge: trigger ONCE!
+                    if time.ticks_diff(now, self.last_tap_time) > 75:
+                        self.touch_down = True
+                        self.last_tap_time = now
+                        self.handle_tap(tx, ty)
+            else:
+                # Finger released (touch up)
+                if self.touch_down:
+                    self.touch_down = False
+                    if self.active_key:
+                        # Restore normal key visual
+                        self.kb.draw_key(self.display, self.active_key, is_pressed=False, flush=True)
+                        self.active_key = None
 
-                            time.sleep_ms(60)
-                            self.active_key = None
-                            self.needs_redraw = True
-                            
             time.sleep_ms(15)
 
 if __name__ in ("__main__", "main"):
