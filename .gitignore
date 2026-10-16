@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Large raw datasets and vendor archives
+kaikki_hebrew.jsonl
+*.7z
+*.zip
+waveshare_demo/
+dict_data.json
+words_en.txt
+words_he.txt
+
+# Scratch and temporary tools
+scratch/
+get_demo.py
+fetch_wiki.py
+
+# OS generated files
+.DS_Store
+Thumbs.db
